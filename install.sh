@@ -77,11 +77,11 @@ config_after_install() {
     local existing_port=$(/usr/local/x-ui/x-ui setting -show true | grep -Eo 'port: .+' | awk '{print $2}')
     local URL_lists=(
         "https://api4.ipify.org"
-		"https://ipv4.icanhazip.com"
-		"https://v4.api.ipinfo.io/ip"
-		"https://ipv4.myexternalip.com/raw"
-		"https://4.ident.me"
-		"https://check-host.net/ip"
+        "https://ipv4.icanhazip.com"
+        "https://v4.api.ipinfo.io/ip"
+        "https://ipv4.myexternalip.com/raw"
+        "https://4.ident.me"
+        "https://check-host.net/ip"
     )
     local server_ip=""
     for ip_address in "${URL_lists[@]}"; do
@@ -142,6 +142,68 @@ config_after_install() {
     /usr/local/x-ui/x-ui migrate
 }
 
+# === НОВАЯ ФУНКЦИЯ: генерация самоподписанного сертификата и привязка к панели ===
+generate_self_signed_cert() {
+    local cert_dir="/usr/local/x-ui/cert"
+    local cert_file="${cert_dir}/cert.crt"
+    local key_file="${cert_dir}/secret.key"
+
+    mkdir -p "${cert_dir}"
+
+    # Установить openssl, если его нет
+    if ! command -v openssl >/dev/null 2>&1; then
+        case "${release}" in
+        ubuntu | debian | armbian)
+            apt-get update && apt-get install -y -q openssl
+            ;;
+        centos | rhel | almalinux | rocky | ol)
+            yum install -y -q openssl
+            ;;
+        fedora | amzn | virtuozzo)
+            dnf install -y -q openssl
+            ;;
+        arch | manjaro | parch)
+            pacman -Syu --noconfirm openssl
+            ;;
+        opensuse-tumbleweed | opensuse-leap)
+            zypper -q install -y openssl
+            ;;
+        alpine)
+            apk add --no-cache openssl
+            ;;
+        *)
+            apt-get update && apt-get install -y -q openssl
+            ;;
+        esac
+    fi
+
+    # Получаем внешний IPv4 сервера (fallback на 127.0.0.1)
+    local ip=""
+    ip=$(timeout 3 curl -4 -s icanhazip.com || echo "")
+    if [[ -z "${ip}" ]]; then
+        ip="127.0.0.1"
+    fi
+
+    # Генерируем ключ и самоподписанный сертификат на 10 лет
+    openssl genrsa -out "${key_file}" 2048
+    openssl req -key "${key_file}" -new -out "${cert_dir}/cert.csr" -nodes \
+      -subj "/C=AU/ST=StateName/L=CityName/O=CompanyName/OU=CompanySectionName/CN=${ip}" \
+      -addext "subjectAltName=DNS:${ip},DNS:*.${ip},IP:${ip}"
+    openssl x509 -signkey "${key_file}" -in "${cert_dir}/cert.csr" -req -days 3650 -out "${cert_file}"
+
+    rm -f "${cert_dir}/cert.csr"
+
+    chmod 600 "${key_file}"
+    chmod 644 "${cert_file}"
+
+    echo -e "${green}Self-signed certificate generated for 10 years:${plain}"
+    echo -e "${yellow}Certificate path:${plain} ${cert_file}"
+    echo -e "${yellow}Private key path:${plain} ${key_file}"
+
+    # Привязка сертификата к панели (через CLI x-ui)
+    /usr/local/x-ui/x-ui setting -certFile "${cert_file}" -keyFile "${key_file}"
+}
+
 install_x-ui() {
     cd /usr/local/
 
@@ -199,7 +261,7 @@ install_x-ui() {
     # Extract resources and set permissions
     tar zxvf x-ui-linux-$(arch).tar.gz
     rm x-ui-linux-$(arch).tar.gz -f
-    
+
     cd x-ui
     chmod +x x-ui
     chmod +x x-ui.sh
@@ -211,10 +273,15 @@ install_x-ui() {
     fi
     chmod +x x-ui bin/xray-linux-$(arch)
 
-    # Update x-ui cli and se set permission
+    # Update x-ui cli and set permission
     mv -f /usr/bin/x-ui-temp /usr/bin/x-ui
     chmod +x /usr/bin/x-ui
+
+    # Базовая конфигурация панели
     config_after_install
+
+    # Генерация самоподписанного сертификата и привязка к панели
+    generate_self_signed_cert
 
     if [[ $release == "alpine" ]]; then
         wget --inet4-only -O /etc/init.d/x-ui https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.rc
@@ -233,6 +300,10 @@ install_x-ui() {
     fi
 
     echo -e "${green}x-ui ${tag_version}${plain} installation finished, it is running now..."
+    echo -e ""
+    echo -e "${green}Self-signed certificate for the panel has been generated and applied.${plain}"
+    echo -e "${yellow}Certificate path:${plain} /usr/local/x-ui/cert/cert.crt"
+    echo -e "${yellow}Private key path:${plain} /usr/local/x-ui/cert/secret.key"
     echo -e ""
     echo -e "┌───────────────────────────────────────────────────────┐
 │  ${blue}x-ui control menu usages (subcommands):${plain}              │
@@ -257,3 +328,4 @@ install_x-ui() {
 echo -e "${green}Running...${plain}"
 install_base
 install_x-ui $1
+
