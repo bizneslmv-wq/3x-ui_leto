@@ -42,7 +42,7 @@ echo "Arch: $(arch)"
 install_base() {
     case "${release}" in
     ubuntu | debian | armbian)
-        apt-get update && apt-get install -y -q wget curl tar tzdata
+        apt-get update && apt-get install -y -q wget curl tar tzdata ufw fail2ban
         ;;
     centos | rhel | almalinux | rocky | ol)
         yum -y update && yum install -y -q wget curl tar tzdata
@@ -60,15 +60,147 @@ install_base() {
         apk update && apk add wget curl tar tzdata
         ;;
     *)
-        apt-get update && apt-get install -y -q wget curl tar tzdata
+        apt-get update && apt-get install -y -q wget curl tar tzdata ufw fail2ban
         ;;
     esac
 }
 
 gen_random_string() {
     local length="$1"
-    local random_string=$(LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom | fold -w "$length" | head -n 1)
+    local random_string
+    random_string=$(LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom | fold -w "$length" | head -n 1)
     echo "$random_string"
+}
+
+check_password_strength() {
+    local pass="$1"
+
+    if [[ ${#pass} -lt 8 ]]; then
+        echo "Пароль должен быть не короче 8 символов."
+        return 1
+    fi
+    if ! [[ "$pass" =~ [a-z] ]]; then
+        echo "Пароль должен содержать хотя бы одну строчную букву (a-z)."
+        return 1
+    fi
+    if ! [[ "$pass" =~ [A-Z] ]]; then
+        echo "Пароль должен содержать хотя бы одну прописную букву (A-Z)."
+        return 1
+    fi
+    if ! [[ "$pass" =~ [0-9] ]]; then
+        echo "Пароль должен содержать хотя бы одну цифру (0-9)."
+        return 1
+    fi
+
+    return 0
+}
+
+configure_ssh() {
+    echo -e "${green}=== SSH configuration (port + password) ===${plain}"
+
+    # Смена пароля root
+    while true; do
+        echo "Введите новый пароль для root:"
+        read -s ROOT_PASS1
+        echo
+        echo "Повторите новый пароль для root:"
+        read -s ROOT_PASS2
+        echo
+
+        if [[ "$ROOT_PASS1" != "$ROOT_PASS2" ]]; then
+            echo -e "${red}Пароли не совпадают. Попробуйте ещё раз.${plain}"
+            continue
+        fi
+
+        if ! check_password_strength "$ROOT_PASS1"; then
+            echo -e "${yellow}Пароль не соответствует требованиям. Попробуйте ещё раз.${plain}"
+            continue
+        fi
+
+        echo "root:${ROOT_PASS1}" | chpasswd
+        echo -e "${green}Пароль root успешно изменён.${plain}"
+        break
+    done
+
+    # Смена порта SSH
+    read -rp "Хотите изменить порт SSH (по умолчанию 22)? [y/N]: " CHANGE_SSH_PORT
+    if [[ "$CHANGE_SSH_PORT" =~ ^[Yy]$ ]]; then
+        while true; do
+            read -rp "Введите новый порт SSH (10000–65535): " NEW_SSH_PORT
+            if ! [[ "$NEW_SSH_PORT" =~ ^[0-9]+$ ]]; then
+                echo -e "${red}Порт должен быть числом.${plain}"
+                continue
+            fi
+            if (( NEW_SSH_PORT < 10000 || NEW_SSH_PORT > 65535 )); then
+                echo -e "${red}Порт должен быть в диапазоне 10000–65535.${plain}"
+                continue
+            fi
+            break
+        done
+
+        # Правка /etc/ssh/sshd_config
+        if grep -qE '^[#[:space:]]*Port ' /etc/ssh/sshd_config; then
+            sed -i "s/^[#[:space:]]*Port .*/Port ${NEW_SSH_PORT}/" /etc/ssh/sshd_config
+        else
+            echo "Port ${NEW_SSH_PORT}" >> /etc/ssh/sshd_config
+        fi
+
+        # Разрешаем новый порт SSH и базовые HTTPS-порты в UFW (если установлен)
+        if command -v ufw >/dev/null 2>&1; then
+            ufw allow "${NEW_SSH_PORT}"/tcp >/dev/null 2>&1 || true
+            ufw allow 443/tcp >/dev/null 2>&1 || true
+            ufw allow 8443/tcp >/dev/null 2>&1 || true
+        fi
+
+        systemctl restart sshd || systemctl restart ssh
+
+        echo -e "${green}Порт SSH изменён на ${NEW_SSH_PORT}.${plain}"
+        echo -e "${yellow}Не забудьте подключаться: ssh -p ${NEW_SSH_PORT} user@server${plain}"
+    else
+        echo -e "${yellow}Порт SSH оставлен без изменений.${plain}"
+        # Но всё равно откроем 443 и 8443, если UFW есть
+        if command -v ufw >/dev/null 2>&1; then
+            ufw allow 443/tcp >/dev/null 2>&1 || true
+            ufw allow 8443/tcp >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+configure_fail2ban() {
+    if [[ -f /etc/fail2ban/jail.local ]]; then
+        # Обновляем bantime, если строка уже есть
+        if grep -q "^bantime" /etc/fail2ban/jail.local; then
+            sed -i 's/^bantime.*/bantime  = 2592000/' /etc/fail2ban/jail.local
+        else
+            sed -i '1i bantime  = 2592000' /etc/fail2ban/jail.local
+        fi
+    else
+        cat >/etc/fail2ban/jail.local << 'EOF'
+[DEFAULT]
+bantime  = 2592000   ; 30 дней
+findtime = 600
+maxretry = 5
+backend  = systemd
+
+[sshd]
+enabled  = true
+port     = ssh
+logpath  = %(sshd_log)s
+EOF
+    fi
+
+    systemctl enable fail2ban >/dev/null 2>&1 || true
+    systemctl restart fail2ban >/dev/null 2>&1 || true
+
+    echo -e "${green}Fail2Ban включён. Время блокировки: 30 дней.${plain}"
+}
+
+block_ping() {
+    # Запретить входящий ping (ICMP echo-request) через UFW
+    if command -v ufw >/dev/null 2>&1; then
+        ufw deny proto icmp from any to any >/dev/null 2>&1 || true
+        echo -e "${green}Запрет входящих ping (ICMP echo-request) через UFW включён.${plain}"
+    fi
 }
 
 config_after_install() {
@@ -93,16 +225,25 @@ config_after_install() {
 
     if [[ ${#existing_webBasePath} -lt 4 ]]; then
         if [[ "$existing_hasDefaultCredential" == "true" ]]; then
-            local config_webBasePath=$(gen_random_string 18)
-            local config_username=$(gen_random_string 10)
-            local config_password=$(gen_random_string 10)
+            local config_webBasePath
+            local config_username
+            local config_password
+            local config_port
+
+            config_webBasePath=$(gen_random_string 64)
+            config_username=$(gen_random_string 64)
+            config_password=$(gen_random_string 64)
 
             read -rp "Would you like to customize the Panel Port settings? (If not, a random port will be applied) [y/n]: " config_confirm
             if [[ "${config_confirm}" == "y" || "${config_confirm}" == "Y" ]]; then
-                read -rp "Please set up the panel port: " config_port
+                read -rp "Please set up the panel port (10000–65535): " config_port
+                if ! [[ "$config_port" =~ ^[0-9]+$ ]]; then
+                    echo -e "${red}Порт должен быть числом. Будет выбран случайный порт.${plain}"
+                    config_port=$(shuf -i 10000-65535 -n 1)
+                fi
                 echo -e "${yellow}Your Panel Port is: ${config_port}${plain}"
             else
-                local config_port=$(shuf -i 1024-62000 -n 1)
+                config_port=$(shuf -i 10000-65535 -n 1)
                 echo -e "${yellow}Generated random port: ${config_port}${plain}"
             fi
 
@@ -115,17 +256,32 @@ config_after_install() {
             echo -e "${green}WebBasePath: ${config_webBasePath}${plain}"
             echo -e "${green}Access URL: http://${server_ip}:${config_port}/${config_webBasePath}${plain}"
             echo -e "###############################################"
+
+            # Открываем порт панели в UFW, если есть
+            if command -v ufw >/dev/null 2>&1; then
+                ufw allow "${config_port}"/tcp >/dev/null 2>&1 || true
+            fi
+
         else
-            local config_webBasePath=$(gen_random_string 18)
+            local config_webBasePath
+            config_webBasePath=$(gen_random_string 64)
             echo -e "${yellow}WebBasePath is missing or too short. Generating a new one...${plain}"
             /usr/local/x-ui/x-ui setting -webBasePath "${config_webBasePath}"
             echo -e "${green}New WebBasePath: ${config_webBasePath}${plain}"
             echo -e "${green}Access URL: http://${server_ip}:${existing_port}/${config_webBasePath}${plain}"
+
+            # Открываем существующий порт панели в UFW, если есть
+            if command -v ufw >/dev/null 2>&1 && [[ -n "${existing_port}" ]]; then
+                ufw allow "${existing_port}"/tcp >/dev/null 2>&1 || true
+            fi
         fi
     else
         if [[ "$existing_hasDefaultCredential" == "true" ]]; then
-            local config_username=$(gen_random_string 10)
-            local config_password=$(gen_random_string 10)
+            local config_username
+            local config_password
+
+            config_username=$(gen_random_string 64)
+            config_password=$(gen_random_string 64)
 
             echo -e "${yellow}Default credentials detected. Security update required...${plain}"
             /usr/local/x-ui/x-ui setting -username "${config_username}" -password "${config_password}"
@@ -137,12 +293,17 @@ config_after_install() {
         else
             echo -e "${green}Username, Password, and WebBasePath are properly set. Exiting...${plain}"
         fi
+
+        # Убедимся, что текущий порт панели открыт в UFW
+        if command -v ufw >/dev/null 2>&1 && [[ -n "${existing_port}" ]]; then
+            ufw allow "${existing_port}"/tcp >/dev/null 2>&1 || true
+        fi
     fi
 
     /usr/local/x-ui/x-ui migrate
 }
 
-# === НОВАЯ ФУНКЦИЯ: генерация самоподписанного сертификата и привязка к панели ===
+# Генерация самоподписанного сертификата и привязка к панели
 generate_self_signed_cert() {
     local cert_dir="/usr/local/x-ui/cert"
     local cert_file="${cert_dir}/cert.crt"
@@ -277,6 +438,84 @@ install_x-ui() {
     mv -f /usr/bin/x-ui-temp /usr/bin/x-ui
     chmod +x /usr/bin/x-ui
 
+    # Создаём скрипт смены порта и пути панели
+    cat >/usr/local/x-ui/change-panel-access.sh << 'EOF'
+#!/bin/bash
+red='\033[0;31m'
+green='\033[0;32m'
+yellow='\033[0;33m'
+plain='\033[0m'
+if [[ $EUID -ne 0 ]]; then
+  echo -e "${red}Этот скрипт нужно запускать от root (sudo).${plain}"
+  exit 1
+fi
+if [[ ! -x /usr/local/x-ui/x-ui ]]; then
+  echo -e "${red}Не найден /usr/local/x-ui/x-ui. Похоже, 3X-UI не установлен.${plain}"
+  exit 1
+fi
+gen_random_string() {
+    local length="$1"
+    local random_string
+    random_string=$(LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom | fold -w "$length" | head -n 1)
+    echo "$random_string"
+}
+existing_port=$(/usr/local/x-ui/x-ui setting -show true | grep -Eo 'port: .+' | awk '{print $2}')
+existing_webBasePath=$(/usr/local/x-ui/x-ui setting -show true | grep -Eo 'webBasePath: .+' | awk '{print $2}')
+echo -e "${yellow}Текущие настройки панели:${plain}"
+echo -e "Port: ${green}${existing_port}${plain}"
+echo -e "WebBasePath: ${green}${existing_webBasePath}${plain}"
+echo
+config_port=$(shuf -i 10000-65535 -n 1)
+config_webBasePath=$(gen_random_string 64)
+echo -e "${yellow}Будут установлены новые значения:${plain}"
+echo -e "Новый порт панели: ${green}${config_port}${plain}"
+echo -e "Новый WebBasePath: ${green}${config_webBasePath}${plain}"
+echo
+read -rp "Применить эти настройки? [y/N]: " confirm
+if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    echo -e "${yellow}Отменено пользователем.${plain}"
+    exit 0
+fi
+URL_lists=(
+    "https://api4.ipify.org"
+    "https://ipv4.icanhazip.com"
+    "https://v4.api.ipinfo.io/ip"
+    "https://ipv4.myexternalip.com/raw"
+    "https://4.ident.me"
+    "https://check-host.net/ip"
+)
+server_ip=""
+for ip_address in "${URL_lists[@]}"; do
+    server_ip=$(curl -s --max-time 3 "${ip_address}" 2>/dev/null | tr -d '[:space:]')
+    if [[ -n "${server_ip}" ]]; then
+        break
+    fi
+done
+/usr/local/x-ui/x-ui setting -port "${config_port}" -webBasePath "${config_webBasePath}"
+if command -v ufw >/dev/null 2>&1; then
+    ufw allow "${config_port}"/tcp >/dev/null 2>&1 || true
+    if [[ -n "${existing_port}" ]]; then
+        read -rp "Закрыть старый порт панели ${existing_port} в UFW? [y/N]: " close_old
+        if [[ "$close_old" =~ ^[Yy]$ ]]; then
+            ufw delete allow "${existing_port}"/tcp >/dev/null 2>&1 || true
+        fi
+    fi
+fi
+echo
+echo -e "${green}Настройки панели обновлены.${plain}"
+if [[ -n "${server_ip}" ]]; then
+    echo -e "${yellow}Новый URL для доступа к панели:${plain}"
+    echo -e "${green}http://${server_ip}:${config_port}/${config_webBasePath}${plain}"
+else
+    echo -e "${yellow}Внешний IP не удалось определить. Используйте IP сервера вручную:${plain}"
+    echo -e "${green}http://<SERVER_IP>:${config_port}/${config_webBasePath}${plain}"
+fi
+echo
+echo -e "${yellow}Не забудьте сохранить новый URL и порт.${plain}"
+EOF
+
+    chmod +x /usr/local/x-ui/change-panel-access.sh
+
     # Базовая конфигурация панели
     config_after_install
 
@@ -305,6 +544,8 @@ install_x-ui() {
     echo -e "${yellow}Certificate path:${plain} /usr/local/x-ui/cert/cert.crt"
     echo -e "${yellow}Private key path:${plain} /usr/local/x-ui/cert/secret.key"
     echo -e ""
+    echo -e "${yellow}Для смены порта и пути панели используйте:${plain} /usr/local/x-ui/change-panel-access.sh"
+    echo -e ""
     echo -e "┌───────────────────────────────────────────────────────┐
 │  ${blue}x-ui control menu usages (subcommands):${plain}              │
 │                                                       │
@@ -325,7 +566,25 @@ install_x-ui() {
 └───────────────────────────────────────────────────────┘"
 }
 
+configure_logrotate() {
+    cat >/etc/logrotate.d/x-ui << 'EOF'
+/var/log/xray/*.log /var/log/x-ui/*.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+
+    echo -e "${green}Logrotate для логов Xray/3X-UI настроен.${plain}"
+}
+
 echo -e "${green}Running...${plain}"
 install_base
+configure_ssh
+configure_fail2ban
+block_ping
 install_x-ui $1
-
+configure_logrotate
