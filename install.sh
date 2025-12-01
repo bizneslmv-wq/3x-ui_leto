@@ -8,6 +8,13 @@ plain='\033[0m'
 
 cur_dir=$(pwd)
 
+# Глобальные переменные для итогового вывода
+PANEL_USER=""
+PANEL_PASS=""
+PANEL_PORT=""
+PANEL_PATH=""
+SERVER_IP_PRINT=""
+
 # check root
 [[ $EUID -ne 0 ]] && echo -e "${red}Fatal error: ${plain} Please run this script with root privilege \n " && exit 1
 
@@ -222,6 +229,7 @@ config_after_install() {
             break
         fi
     done
+    SERVER_IP_PRINT="${server_ip}"
 
     if [[ ${#existing_webBasePath} -lt 4 ]]; then
         if [[ "$existing_hasDefaultCredential" == "true" ]]; then
@@ -257,6 +265,12 @@ config_after_install() {
             echo -e "${green}Access URL: http://${server_ip}:${config_port}/${config_webBasePath}${plain}"
             echo -e "###############################################"
 
+            # Заполним глобальные переменные
+            PANEL_USER="${config_username}"
+            PANEL_PASS="${config_password}"
+            PANEL_PORT="${config_port}"
+            PANEL_PATH="${config_webBasePath}"
+
             # Открываем порт панели в UFW, если есть
             if command -v ufw >/dev/null 2>&1; then
                 ufw allow "${config_port}"/tcp >/dev/null 2>&1 || true
@@ -269,6 +283,9 @@ config_after_install() {
             /usr/local/x-ui/x-ui setting -webBasePath "${config_webBasePath}"
             echo -e "${green}New WebBasePath: ${config_webBasePath}${plain}"
             echo -e "${green}Access URL: http://${server_ip}:${existing_port}/${config_webBasePath}${plain}"
+
+            PANEL_PORT="${existing_port}"
+            PANEL_PATH="${config_webBasePath}"
 
             # Открываем существующий порт панели в UFW, если есть
             if command -v ufw >/dev/null 2>&1 && [[ -n "${existing_port}" ]]; then
@@ -290,8 +307,15 @@ config_after_install() {
             echo -e "${green}Username: ${config_username}${plain}"
             echo -e "${green}Password: ${config_password}${plain}"
             echo -e "###############################################"
+
+            PANEL_USER="${config_username}"
+            PANEL_PASS="${config_password}"
+            PANEL_PORT="${existing_port}"
+            PANEL_PATH="${existing_webBasePath}"
         else
             echo -e "${green}Username, Password, and WebBasePath are properly set. Exiting...${plain}"
+            PANEL_PORT="${existing_port}"
+            PANEL_PATH="${existing_webBasePath}"
         fi
 
         # Убедимся, что текущий порт панели открыт в UFW
@@ -581,6 +605,27 @@ EOF
     echo -e "${green}Logrotate для логов Xray/3X-UI настроен.${plain}"
 }
 
+print_summary() {
+    echo
+    echo -e "${green}=========== INSTALL SUMMARY ==========${plain}"
+    if [[ -n "${SERVER_IP_PRINT}" && -n "${PANEL_PORT}" && -n "${PANEL_PATH}" ]]; then
+        echo -e "${yellow}Панель 3X-UI:${plain}"
+        echo -e "  URL:      ${green}http://${SERVER_IP_PRINT}:${PANEL_PORT}/${PANEL_PATH}${plain}"
+    fi
+    if [[ -n "${PANEL_USER}" ]]; then
+        echo -e "  Username: ${green}${PANEL_USER}${plain}"
+    fi
+    if [[ -n "${PANEL_PASS}" ]]; then
+        echo -e "  Password: ${green}${PANEL_PASS}${plain}"
+    fi
+    echo
+    echo -e "${yellow}Данные сервера:${plain}"
+    echo -e "  OS:   ${green}${release}${plain}"
+    echo -e "  Arch: ${green}$(arch)${plain}"
+    echo -e "  SSH:  ${green}используйте текущий порт (22 или тот, что вы указали при установке)${plain}"
+    echo
+}
+
 echo -e "${green}Running...${plain}"
 install_base
 configure_ssh
@@ -588,3 +633,4 @@ configure_fail2ban
 block_ping
 install_x-ui $1
 configure_logrotate
+print_summary
