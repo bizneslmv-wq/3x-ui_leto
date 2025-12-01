@@ -608,29 +608,15 @@ EOF
 print_summary() {
     echo
     echo -e "${green}=========== INSTALL SUMMARY ==========${plain}"
+    echo -e "${yellow}Данные панели 3X-UI:${plain}"
     if [[ -n "${SERVER_IP_PRINT}" && -n "${PANEL_PORT}" && -n "${PANEL_PATH}" ]]; then
-        echo -e "${yellow}Панель 3X-UI:${plain}"
-        echo -e "  URL:      ${green}http://${SERVER_IP_PRINT}:${PANEL_PORT}/${PANEL_PATH}${plain}"
+        echo -e "  URL:        ${green}http://${SERVER_IP_PRINT}:${PANEL_PORT}/${PANEL_PATH}${plain}"
     fi
     if [[ -n "${PANEL_USER}" ]]; then
-        echo -e "  Username: ${green}${PANEL_USER}${plain}"
+        echo -e "  Login:      ${green}${PANEL_USER}${plain}"
     fi
     if [[ -n "${PANEL_PASS}" ]]; then
-        echo -e "  Password: ${green}${PANEL_PASS}${plain}"
+        echo -e "  Password:   ${green}${PANEL_PASS}${plain}"
     fi
-    echo
-    echo -e "${yellow}Данные сервера:${plain}"
-    echo -e "  OS:   ${green}${release}${plain}"
-    echo -e "  Arch: ${green}$(arch)${plain}"
-    echo -e "  SSH:  ${green}используйте текущий порт (22 или тот, что вы указали при установке)${plain}"
-    echo
-}
-
-echo -e "${green}Running...${plain}"
-install_base
-configure_ssh
-configure_fail2ban
-block_ping
-install_x-ui $1
-configure_logrotate
-print_summary
+    if [[ -n "${PANEL_PORT}" ]]; then
+        echo -e "  Port
